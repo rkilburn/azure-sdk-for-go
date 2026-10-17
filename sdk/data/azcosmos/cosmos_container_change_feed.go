@@ -227,6 +227,10 @@ func (c *ContainerClient) getChangeFeedForQueue(
 	pkRangeGoneAttempts := 0
 
 	var lastResp ChangeFeedResponse
+	// lastEmptyOK is the most recent 200 with zero documents. A head can
+	// return one with changes still to come, so when any head did, the
+	// drain must not report 304 just because the last head it visited did.
+	var lastEmptyOK ChangeFeedResponse
 	var totalRequestCharge float32
 
 	// finalize attaches the rotated continuation token and the aggregated
@@ -410,15 +414,24 @@ func (c *ContainerClient) getChangeFeedForQueue(
 			return finalize(response)
 		}
 
+		if response.RawResponse != nil && response.RawResponse.StatusCode == http.StatusOK {
+			lastEmptyOK = response
+		}
+
 		// 304 (or 200 with zero documents) → keep draining the rest of the queue.
 	}
 
-	// Whole queue drained without finding documents. Return the last (empty)
+	// Whole queue drained without finding documents. Return an empty
 	// response with the rotated continuation token so the caller knows the
-	// drain progressed and can poll again later.
+	// drain progressed and can poll again later. It is a 304 only when every
+	// head returned 304, matching .NET's cross-partition change feed: a 304
+	// tells the caller the feed is caught up, which one empty 200 disproves.
 	if lastResp.RawResponse == nil {
 		// Nothing was issued (queue was empty). Synthesize an empty response.
 		return ChangeFeedResponse{}, nil
+	}
+	if lastEmptyOK.RawResponse != nil {
+		return finalize(lastEmptyOK)
 	}
 	return finalize(lastResp)
 }

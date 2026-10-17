@@ -10,6 +10,8 @@
 
 ### Bugs Fixed
 
+* Fixed `ReadChangeFeed` returning 304 Not Modified across several feed ranges when only the last range read returned 304. It now returns 304 only when every range did, and otherwise an empty 200, so callers polling until 304 don't stop while a range still has changes to come.
+
 ### Other Changes
 
 ## 1.6.0-beta.4 (2026-10-14)
