@@ -617,3 +617,93 @@ func TestReadChangeFeed_410BudgetExhaustedMidDrain_SurfacesPartialState(t *testi
 	require.NotEmpty(t, resp.ContinuationToken,
 		"partial response must carry a rotated continuation token after 410-budget exhaustion")
 }
+
+// drainTwoRanges reads the change feed once from a resume token queueing two
+// ranges, A=[00,55) then B=[55,FF), with each read answered by the next of
+// responses, and returns the response and how many ranges were read.
+func drainTwoRanges(t *testing.T, responses ...[]mock.ResponseOption) (ChangeFeedResponse, int32) {
+	t.Helper()
+	srv, closeSrv := mock.NewTLSServer()
+	t.Cleanup(closeSrv)
+
+	ranges := []partitionKeyRange{
+		{ID: "A", MinInclusive: "00", MaxExclusive: "55", ResourceID: "testRID"},
+		{ID: "B", MinInclusive: "55", MaxExclusive: "FF", ResourceID: "testRID"},
+	}
+	var cfCount atomic.Int32
+	counter := policyFunc(func(req *policy.Request) (*http.Response, error) {
+		if req.Raw().Header.Get(cosmosHeaderChangeFeed) == cosmosHeaderValuesChangeFeed &&
+			strings.HasSuffix(req.Raw().URL.Path, "/docs") {
+			cfCount.Add(1)
+		}
+		return req.Next()
+	})
+	client := createChangeFeedTestClient(t, srv, []policy.Policy{counter}, ranges)
+	for _, response := range responses {
+		srv.AppendResponse(response...)
+	}
+
+	database, _ := newDatabase("databaseId", client)
+	container, _ := newContainer("containerId", database)
+
+	prevA := azcore.ETag("\"prev-A\"")
+	prevB := azcore.ETag("\"prev-B\"")
+	tokenJSON, err := json.Marshal(compositeContinuationToken{
+		Version:    cosmosCompositeContinuationTokenVersion,
+		ResourceID: "testRID",
+		Continuation: []changeFeedRange{
+			{MinInclusive: "00", MaxExclusive: "55", ContinuationToken: &prevA},
+			{MinInclusive: "55", MaxExclusive: "FF", ContinuationToken: &prevB},
+		},
+	})
+	require.NoError(t, err)
+	tokenStr := string(tokenJSON)
+
+	resp, err := container.ReadChangeFeed(context.Background(), &ChangeFeedOptions{
+		Continuation: &tokenStr,
+	})
+	require.NoError(t, err)
+	return resp, cfCount.Load()
+}
+
+// TestReadChangeFeed_EmptyOKThenNotModified_IsNotNotModified — a drain where
+// one range returns 200 with no documents and the last range visited returns
+// 304 must not report 304. The service can return an empty 200 with changes
+// still to come, and callers stop polling on 304, so reporting the last
+// range's 304 would tell them the feed is caught up when it may not be.
+func TestReadChangeFeed_EmptyOKThenNotModified_IsNotNotModified(t *testing.T) {
+	emptyBody := []byte(`{"_rid":"testRID","Documents":[],"_count":0}`)
+	resp, reads := drainTwoRanges(t,
+		[]mock.ResponseOption{mock.WithBody(emptyBody), mock.WithStatusCode(http.StatusOK), mock.WithHeader(cosmosHeaderEtag, "\"etag-A\"")},
+		[]mock.ResponseOption{mock.WithStatusCode(http.StatusNotModified), mock.WithHeader(cosmosHeaderEtag, "\"etag-B\"")},
+	)
+
+	require.Equal(t, int32(2), reads, "the drain must read both ranges")
+	require.Equal(t, http.StatusOK, resp.RawResponse.StatusCode,
+		"an empty 200 from any range means the drain isn't caught up, so it must not report 304")
+	require.Equal(t, 0, resp.Count)
+
+	var rt compositeContinuationToken
+	require.NoError(t, json.Unmarshal([]byte(resp.ContinuationToken), &rt))
+	require.Len(t, rt.Continuation, 2)
+	require.Equal(t, azcore.ETag("\"etag-A\""), *rt.Continuation[0].ContinuationToken, "A must carry its new ETag")
+	require.Equal(t, azcore.ETag("\"etag-B\""), *rt.Continuation[1].ContinuationToken, "B must carry its new ETag")
+}
+
+// TestReadChangeFeed_AllRangesNotModified_IsNotModified — a drain where every
+// range returns 304 reports 304, so callers know the feed is caught up.
+func TestReadChangeFeed_AllRangesNotModified_IsNotModified(t *testing.T) {
+	resp, reads := drainTwoRanges(t,
+		[]mock.ResponseOption{mock.WithStatusCode(http.StatusNotModified), mock.WithHeader(cosmosHeaderEtag, "\"etag-A\"")},
+		[]mock.ResponseOption{mock.WithStatusCode(http.StatusNotModified), mock.WithHeader(cosmosHeaderEtag, "\"etag-B\"")},
+	)
+
+	require.Equal(t, int32(2), reads, "the drain must read both ranges")
+	require.Equal(t, http.StatusNotModified, resp.RawResponse.StatusCode)
+
+	var rt compositeContinuationToken
+	require.NoError(t, json.Unmarshal([]byte(resp.ContinuationToken), &rt))
+	require.Len(t, rt.Continuation, 2)
+	require.Equal(t, azcore.ETag("\"etag-A\""), *rt.Continuation[0].ContinuationToken, "A must carry its new ETag")
+	require.Equal(t, azcore.ETag("\"etag-B\""), *rt.Continuation[1].ContinuationToken, "B must carry its new ETag")
+}
