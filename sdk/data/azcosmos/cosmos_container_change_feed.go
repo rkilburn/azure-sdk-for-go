@@ -305,7 +305,11 @@ func (c *ContainerClient) getChangeFeedForQueue(
 				// Hit the safety cap. This shouldn't happen in practice
 				// (bounded by the service's physical-partition limit), but a
 				// bug in overlap resolution producing duplicate children
-				// would otherwise spin forever. Return what we have so far.
+				// would otherwise spin forever. Return what we have so far,
+				// preferring an empty 200 to a 304 as at the end of the drain.
+				if lastEmptyOK.RawResponse != nil {
+					return finalize(lastEmptyOK)
+				}
 				if lastResp.RawResponse != nil {
 					return finalize(lastResp)
 				}
@@ -424,8 +428,9 @@ func (c *ContainerClient) getChangeFeedForQueue(
 	// Whole queue drained without finding documents. Return an empty
 	// response with the rotated continuation token so the caller knows the
 	// drain progressed and can poll again later. It is a 304 only when every
-	// head returned 304, matching .NET's cross-partition change feed: a 304
-	// tells the caller the feed is caught up, which one empty 200 disproves.
+	// head returned 304, matching .NET's CrossPartitionChangeFeedAsyncEnumerator:
+	// a 304 tells the caller the feed is caught up, which one empty 200
+	// disproves.
 	if lastResp.RawResponse == nil {
 		// Nothing was issued (queue was empty). Synthesize an empty response.
 		return ChangeFeedResponse{}, nil

@@ -700,4 +700,10 @@ func TestReadChangeFeed_AllRangesNotModified_IsNotModified(t *testing.T) {
 
 	require.Equal(t, int32(2), reads, "the drain must read both ranges")
 	require.Equal(t, http.StatusNotModified, resp.RawResponse.StatusCode)
+
+	var rt compositeContinuationToken
+	require.NoError(t, json.Unmarshal([]byte(resp.ContinuationToken), &rt))
+	require.Len(t, rt.Continuation, 2)
+	require.Equal(t, azcore.ETag("\"etag-A\""), *rt.Continuation[0].ContinuationToken, "A must carry its new ETag")
+	require.Equal(t, azcore.ETag("\"etag-B\""), *rt.Continuation[1].ContinuationToken, "B must carry its new ETag")
 }
